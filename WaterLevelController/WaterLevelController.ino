@@ -11,6 +11,8 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <PubSubClient.h>
+#include <LiquidCrystal.h>
+
 
 // Enable or disable debug prints on serial
 #define DEBUG true
@@ -71,8 +73,24 @@
 #define MAX_RANGE 1024
 #define INPUT_MV 5000
 
+// LCD specifics
+#define LCD_COLS 20
+#define LCD_ROWS 4
+#define LCD_RS_GPIO 28
+#define LCD_EN_GPIO 29
+#define LCD_D4_GPIO 30
+#define LCD_D5_GPIO 31
+#define LCD_D6_GPIO 32
+#define LCD_D7_GPIO 33
+#define MOTOR_ROW 0
+#define OHT_ROW 1
+#define S2_ROW 2
+
 // Check the levels interval
 #define CHECK_INT 15
+
+// initialize the library with the numbers of the interface pins
+LiquidCrystal lcd(LCD_RS_GPIO, LCD_EN_GPIO, LCD_D4_GPIO, LCD_D5_GPIO, LCD_D6_GPIO, LCD_D7_GPIO);
 
 // Enter a MAC address for your controller below.
 // Newer Ethernet shields have a MAC address printed on a sticker on the shield
@@ -140,10 +158,45 @@ class Debug {
 
 Debug debug = Debug(DEBUG, INFO);
 
+class LcdDisplay {
+  int rows = LCD_ROWS;
+  int cols = LCD_COLS;
+  int err_row = LCD_COLS - 1; // Last line on display
+  bool err_disp = false;
+
+  public:
+    void display(int row, const char* str) {
+      int max_row = err_row;
+      if (err_disp) {
+        max_row = err_row - 1;
+      }
+      int r = row;
+      if (row > max_row) {
+        r = max_row;
+      }
+      lcd.setCursor(0, r);
+      lcd.print(str);
+    }
+
+    void error(const char* str) {
+      err_disp = true;
+      lcd.setCursor(0, err_row);
+      lcd.print(str);
+    }
+
+    void clear_err() {
+      err_disp = false;
+      lcd.setCursor(0, err_row);
+      lcd.print(' ');
+    }
+};
+
+LcdDisplay ld;
+
 class LevelSensor {
   int trigger;
   int echo;
-  const long tries = 5;
+  const long tries = 3;
   long max_ht = 0;
   long min_ht = 0;
   
@@ -162,7 +215,7 @@ class LevelSensor {
   
       // Transmitting pulse
       digitalWrite(trigger, LOW);
-      delayMicroseconds(10);
+      delayMicroseconds(2);
       digitalWrite(trigger, HIGH);
       delayMicroseconds(10);
       digitalWrite(trigger, LOW);
@@ -174,7 +227,12 @@ class LevelSensor {
       h = t / 58;
       debug.debug("Height calculated: %d", h);
     
-      return h;
+      if ((h >= min_ht) && (h <= max_ht)) {
+        return h;
+      }
+      else {
+        return h;
+      }
     }
 
     long check_avg() {
@@ -185,7 +243,11 @@ class LevelSensor {
         if ((h >= min_ht) && (h <= max_ht)) {
           acc += h;
           count++;
-        } 
+        }
+        delay(100);
+      }
+      if (count == 0) {
+        return -1;
       }
       long avg = acc/count;
       debug.debug("Height avg calculated: %d", avg);
@@ -303,7 +365,15 @@ class Tank {
   long high_th = 0; // Caluclated upper thershold
   long low_th = 0; // Lower threshold
 
+  int disp_row = 0; //Display row
+  const char* disp_name; // Name for display
+
   public:
+    void set_display(int row, const char* name) {
+      disp_row = row;
+      disp_name = name;
+    }
+
     void set(int trig, int ec, int ht, int off, int upper, int lower, const char* topic) {
       ls.set(trig, ec, off, ht+off);
       pub.set(topic, 60, 3);
@@ -320,7 +390,17 @@ class Tank {
 
     int check() {
       int ret = 0;
-      long h = max_ht - (ls.check_avg() - offset);
+      long l = ls.check_avg();
+      while (l == -1) {
+        delay(500);
+        l = ls.check();
+      }
+      long h = max_ht - (l - offset);
+      int p = h * 100 / max_ht;
+      char str[LCD_COLS+1];
+      snprintf(str, LCD_COLS, "%-9s:%3ld (%3d)", disp_name, h, p);
+      ld.display(disp_row, str);
+
       if (h <= low_th) {
         ret = -1;
       }
@@ -334,9 +414,17 @@ class Tank {
 };
 
 class OverheadTank: public Tank {
+  public:
+    OverheadTank(){
+      set_display(OHT_ROW, "Overhead");
+    }
 };
 
 class StorageTank: public Tank {
+  public:
+    StorageTank(){
+      set_display(S2_ROW, "Sump");
+    }
 };
 
 class Motor {
@@ -350,8 +438,14 @@ class Motor {
   long last_off;
   Publish spub;
   Publish cpub;
+  const int disp_row = MOTOR_ROW;
+  const char *disp_name;
 
   public:
+    Motor():
+    disp_name("Motor"){
+    }
+
     void set(int relay_gpio, int curr_gpio, int dur, const char* state_topic, const char* cur_topic) {
       spub.set(state_topic, 60);
       cpub.set(cur_topic, 60, 1);
@@ -364,6 +458,9 @@ class Motor {
       last_off = 0;
       pinMode(relay, OUTPUT);
       digitalWrite(relay, HIGH); 
+      char str[LCD_COLS+1];
+      snprintf(str, LCD_COLS, "%-9s: OFF", disp_name);
+      ld.display(disp_row, str);
     }
 
     bool is_on() {
@@ -391,6 +488,9 @@ class Motor {
         last_off = millis();
         on = false;
         debug.info("Motor off");
+        char str[LCD_COLS+1];
+        snprintf(str, LCD_COLS, "%-9s: OFF", disp_name);
+        ld.display(disp_row, str);
       }
       digitalWrite(relay, HIGH);
       spub.updateState(on);
@@ -430,7 +530,10 @@ class Motor {
       if (on) {
         digitalWrite(relay, LOW);
         spub.updateState(on);
-        current();
+        long amps = current();
+        char str[LCD_COLS+1];
+        snprintf(str, LCD_COLS, "%-9s: ON (%ld)", disp_name, amps);
+        ld.display(disp_row, str);
       }
     }
 };
@@ -528,6 +631,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
 void setup() {
   // Open serial communications and wait for port to open:
   Serial.begin(115200);
+
+  lcd.begin(LCD_COLS, LCD_ROWS);
 
   // start the Ethernet connection:
   if (Ethernet.begin(mac) == 0) {
