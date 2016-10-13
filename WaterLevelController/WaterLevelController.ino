@@ -67,6 +67,9 @@
 #define M2_RELAY 26
 // Cuurent sensor Analog pin
 #define M2_CUR A0
+// Flow check
+#define FLOW_DUR 5 // Check flow every 5 mins
+#define MIN_FLOW_EXP 5 // Minimum change in level
 // Current sensor details for ACS712 - 20A
 #define MVPERAMP 100
 #define ACSOFFSET 2500
@@ -82,9 +85,9 @@
 #define LCD_D5_GPIO 31
 #define LCD_D6_GPIO 32
 #define LCD_D7_GPIO 33
-#define MOTOR_ROW 0
-#define OHT_ROW 1
-#define S2_ROW 2
+#define MOTOR_ROW 1
+#define OHT_ROW 2
+#define S2_ROW 3
 
 // Check the levels interval
 #define CHECK_INT 15
@@ -159,20 +162,16 @@ class Debug {
 Debug debug = Debug(DEBUG, INFO);
 
 class LcdDisplay {
-  int rows = LCD_ROWS;
+  int rows = LCD_ROWS - 1;
   int cols = LCD_COLS;
-  int err_row = LCD_COLS - 1; // Last line on display
+  int err_row = 0; // First line on display
   bool err_disp = false;
 
   public:
     void display(int row, const char* str) {
-      int max_row = err_row;
-      if (err_disp) {
-        max_row = err_row - 1;
-      }
       int r = row;
-      if (row > max_row) {
-        r = max_row;
+      if (row > rows) {
+        r = rows;
       }
       lcd.setCursor(0, r);
       lcd.print(str);
@@ -329,19 +328,18 @@ class Publish {
     }
 
     void updateState(bool state) {
-      if ((state != lastState) ||((millis() - lastUpdate) >= interval)) {
+      if ((state != lastState) || (lastUpdate == 0) || ((millis() - lastUpdate) >= interval)) {
         if (reconnect()) {
           lastState = state;
           if (state) {
-            strncpy(buf_len-1, buf, "ON");
+            strncpy(buf, "ON", buf_len-1);
           }
           else {
-            strncpy(buf_len-1, buf, "OFF");
+            strncpy(buf, "OFF", buf_len-1);
           }
-          char *pubState = String(lastState).c_str();
           lastUpdate = millis();
-          client.publish(my_topic, pubState);
-          debug.debug("Published topic %s with state: %s", my_topic, pubState);
+          client.publish(my_topic, buf);
+          debug.debug("Published topic %s with state: %s", my_topic, buf);
         }
       }
     }
@@ -364,6 +362,7 @@ class Tank {
   long check_int = 1; // Check interval in mins
   long high_th = 0; // Caluclated upper thershold
   long low_th = 0; // Lower threshold
+  long last_h = 0; // Last measurement
 
   int disp_row = 0; //Display row
   const char* disp_name; // Name for display
@@ -388,6 +387,10 @@ class Tank {
       low_th = max_ht * lower_th / 100;      
     }
 
+    long get_last() {
+      return last_h;
+    }
+    
     int check() {
       int ret = 0;
       long l = ls.check_avg();
@@ -396,10 +399,12 @@ class Tank {
         l = ls.check();
       }
       long h = max_ht - (l - offset);
+      last_h = h;
       int p = h * 100 / max_ht;
       char str[LCD_COLS+1];
       snprintf(str, LCD_COLS, "%-9s:%3ld (%3d)", disp_name, h, p);
       ld.display(disp_row, str);
+      debug.debug("%s", str);
 
       if (h <= low_th) {
         ret = -1;
@@ -407,8 +412,8 @@ class Tank {
       else if (h >= high_th) {
         ret = 1;
       }
-      debug.debug("Tank check: %d", ret);
-      pub.updateValue(h);
+      debug.debug("%s Tank check: %d", disp_name, ret);
+      pub.updateValue(p);
       return ret;
     }
 };
@@ -446,6 +451,17 @@ class Motor {
     disp_name("Motor"){
     }
 
+    void lcdisplay() {
+      char str[LCD_COLS+1];
+      if (on) {
+        snprintf(str, LCD_COLS, "%-9s: ON ", disp_name);
+      }
+      else {
+        snprintf(str, LCD_COLS, "%-9s: OFF", disp_name);
+      }
+      ld.display(disp_row, str);
+    }
+    
     void set(int relay_gpio, int curr_gpio, int dur, const char* state_topic, const char* cur_topic) {
       spub.set(state_topic, 60);
       cpub.set(cur_topic, 60, 1);
@@ -458,26 +474,33 @@ class Motor {
       last_off = 0;
       pinMode(relay, OUTPUT);
       digitalWrite(relay, HIGH); 
-      char str[LCD_COLS+1];
-      snprintf(str, LCD_COLS, "%-9s: OFF", disp_name);
-      ld.display(disp_row, str);
+      lcdisplay();
+      spub.updateState(on);
     }
 
     bool is_on() {
       return on;
     }
 
+    long on_duration() {
+      if (on) {
+        return (millis() - last_on);
+      }
+      return -1;
+    }
+    
     long current() {
       long acc = 0;
       for (int i=0; i<tries; i++) {
         long val = analogRead(M2_CUR);
+        debug.debug("Anolg read: %ld", val);
         acc += val;
-        delayMicroseconds(10);
+        //delayMicroseconds(10);
       }
       long val = acc/tries;
-      debug.debug("Analog read: %d", val);
+      debug.debug("Analog read avg: %ld", val);
       long volt = val * INPUT_MV / MAX_RANGE;
-      long amps = (volt - ACSOFFSET) / MVPERAMP;
+      long amps = abs((volt - ACSOFFSET) / MVPERAMP);
       debug.debug("Current drawn: %d", amps);
       cpub.updateValue(amps);
       return amps;
@@ -488,25 +511,25 @@ class Motor {
         last_off = millis();
         on = false;
         debug.info("Motor off");
-        char str[LCD_COLS+1];
-        snprintf(str, LCD_COLS, "%-9s: OFF", disp_name);
-        ld.display(disp_row, str);
+        lcdisplay();
       }
+      debug.info("Switching off motor");
       digitalWrite(relay, HIGH);
       spub.updateState(on);
-      current();
+      // current();
     }
 
     bool check() {
       if (on) {
-        long cur = current();
-        if (cur < 1) {
-          debug.info("No current being drawn");
+        // long cur = current();
+        // if (cur < 1) {
+        //  debug.info("No current being drawn");
           // Motor is not on. Could be power outage
-          switch_off();
-        }
-        else if ((millis() - last_on) > max_duration) {
-          debug.info("Motor on longer than max duration");
+        //   switch_off();
+        // } else
+        long dur = millis() - last_on;
+        if (dur > max_duration) {
+          debug.info("Motor on longer than max duration (%ld, %ld)", dur, max_duration);
           switch_off();
         }
       }
@@ -518,7 +541,7 @@ class Motor {
         check();
       } 
       else {
-        if ((millis() - last_off) >= min_interval) {
+        if ((last_on == 0) || ((millis() - last_off) >= min_interval)) {
           debug.info("Switching on the motor");
           last_on = millis();
           on = true;
@@ -528,12 +551,10 @@ class Motor {
         }
       }
       if (on) {
+        debug.debug("Switching on motor");
         digitalWrite(relay, LOW);
         spub.updateState(on);
-        long amps = current();
-        char str[LCD_COLS+1];
-        snprintf(str, LCD_COLS, "%-9s: ON (%ld)", disp_name, amps);
-        ld.display(disp_row, str);
+        lcdisplay();
       }
     }
 };
@@ -541,6 +562,10 @@ class Motor {
 class WaterLevelController {
   long last_check = 0;
   long interval = CHECK_INT * 1000;
+  long flow_dur = FLOW_DUR * 60 * 1000;
+  long min_flow = MIN_FLOW_EXP;
+  long last_level = 0;
+  long last_flow_chk = 0;
   OverheadTank oht = OverheadTank();
   StorageTank s2 = StorageTank();
   Motor motor = Motor();
@@ -559,19 +584,39 @@ class WaterLevelController {
         if (s2.check() >= 0) {
           // We have enough water in storage tank 2
           int oht_check = oht.check();
+          if (motor.on_duration() > flow_dur) {
+            if ((millis() - last_flow_chk) > flow_dur) {
+              last_flow_chk = millis();
+              long level = oht.get_last();
+              if ((level - last_level) < min_flow) {
+                // Motor not working
+                debug.info("Motor not pumping. Switching off");
+                motor.switch_off(); 
+              }
+              last_level = level;
+            }
+          }
+          else if ((last_level == 0) && motor.is_on()) {
+            // Update the first time motor is on
+            last_level = oht.get_last();
+          }
           if (oht_check < 0) {
+            debug.debug("Switch on motor");
             // Water in overhead tank less than lower threshold
             motor.switch_on();
           }
           else if (oht_check > 0) {
             // Over the high threshold
+            debug.debug("Switch off motor");
             motor.switch_off();
+            last_level = 0;
           }
         }
         else {
           // Water in storage tank 2 below threshold
           motor.switch_off();
-          debug.error("Water level in sump below threshold!");
+          last_level = 0;
+          debug.error("Water level in storage tank below threshold!");
         }
       }
     }
