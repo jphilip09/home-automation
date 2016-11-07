@@ -12,6 +12,18 @@
 
   by Philip Joseph (jphilip09@gmail.com)
 
+  Licensed under the Apache License, Version 2.0 (the "License"); you may
+  not use this file except in compliance with the License. You may obtain
+  a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  License for the specific language governing permissions and limitations
+  under the License.
+
 */
 
 #include <SPI.h>
@@ -34,8 +46,18 @@
 // Current measurement needs to be fixed
 // #define CURRENT_ENABLE
 
+// In case DHCP fails, static IP to use
+#define FALLBACK_IP 10, 168, 1, 12
+
+// MQTT server
+#define MQTT_SERVER 10, 168, 1, 10
+#define MQTT_USER "pi"
+#define MQTT_PASSWD "raspberry"
+
 // Topic
 #define TOPIC "jr-mqtt/wlc"
+// Max interval between publish of a topic in minutes
+#define PUB_INTERVAL 1 
 
 #define topic_cat(sub) TOPIC#sub
 
@@ -124,10 +146,10 @@ byte mac[] = {
 };
 
 // Fallback IP
-IPAddress ip(10, 168, 1, 12);
+IPAddress ip(FALLBACK_IP);
 
 // MQTT server
-IPAddress server(10, 168, 1, 10);
+IPAddress server(MQTT_SERVER);
 
 // Maximum topics to subscribe
 #define MAX_SUBS 10
@@ -289,25 +311,29 @@ class LevelSensor {
 
 class Publish {
 #ifdef NW_SUPPORT
-  int lastUpdate;
+  long interval;
+  long lastUpdate;
+  long diff;
   long lastValue;
   bool lastState;
   char *my_topic;
-  int interval;
-  int diff;
 
   static int sub_count;
   static char* sub_topic[MAX_SUBS];
 
   // buffer to convert value to string
-  static const int buf_len = 16;
+  static const int buf_len = 80;
   static char buf[buf_len];
 #endif
 
   static boolean reconnect() {
 #ifdef NW_SUPPORT
     if (!client.connected()) {
+#ifdef MQTT_USER
+      if (client.connect("jrMqttClient", MQTT_USER, MQTT_PASSWD)) {
+#else
       if (client.connect("jrMqttClient")) {
+#endif
         debug.info("MQTT connected");
         if (sub_count) {
           for (int i=0; i<sub_count; i++) {
@@ -328,10 +354,10 @@ class Publish {
   }
 
   public:
-    void set(const char *topic, int max_interval, int max_diff)
+    void set(const char *topic, long max_interval, long max_diff)
     {
 #ifdef NW_SUPPORT
-      my_topic = topic;
+      my_topic = (char*)topic;
       interval = max_interval * 60 * 1000; //Convert to millisecs
       diff = max_diff;
       lastUpdate = 0;
@@ -351,7 +377,7 @@ class Publish {
         // Already max topics subscribed
         return false;
       }
-      sub_topic[sub_count] = topic.c_str();
+      sub_topic[sub_count] = (char*)topic.c_str();
       sub_count++;
       reconnect();
 #endif
@@ -364,6 +390,20 @@ class Publish {
         if (reconnect()) {
           lastValue = value;
           snprintf(buf, buf_len-1, "%ld", value);
+          lastUpdate = millis();
+          client.publish(my_topic, buf);
+          debug.info("Published topic %s with value: %s (%ld)", my_topic, buf, value);
+        }
+      }
+#endif
+    }
+
+    void updateValue_json(long value, int percentage) {
+#ifdef NW_SUPPORT
+      if ((abs(lastValue - value) >= diff) || ((millis() - lastUpdate) >= interval)) {
+        if (reconnect()) {
+          lastValue = value;
+          snprintf(buf, buf_len-1, "{ \"value\": %ld, \"percentage\": %d }", value, percentage);
           lastUpdate = millis();
           client.publish(my_topic, buf);
           debug.info("Published topic %s with value: %s (%ld)", my_topic, buf, value);
@@ -394,9 +434,9 @@ class Publish {
 
 #ifdef NW_SUPPORT
 // Define the static members
-static int Publish::sub_count = 0;
-static char* Publish::sub_topic[MAX_SUBS];
-static char Publish::buf[Publish::buf_len] = "";
+int Publish::sub_count = 0;
+char* Publish::sub_topic[MAX_SUBS];
+char Publish::buf[Publish::buf_len] = "";
 #endif
 
 class Tank {
@@ -424,7 +464,7 @@ class Tank {
 
     void set(int trig, int ec, int ht, int off, int upper, int lower, const char* topic) {
       ls.set(trig, ec, off, ht+off);
-      pub.set(topic, 60, 3);
+      pub.set(topic, PUB_INTERVAL, 2);
 
       trigger = trig;
       echo = ec;
@@ -461,8 +501,8 @@ class Tank {
       else if (h >= high_th) {
         ret = 1;
       }
-      debug.debug("%s Tank check: %d", disp_name, ret);
-      pub.updateValue(p);
+      debug.debug("%s Tank check: %d (%ld)", disp_name, ret, h);
+      pub.updateValue_json(h, p);
       return ret;
     }
 };
@@ -512,8 +552,8 @@ class Motor {
     }
 
     void set(int relay_gpio, int curr_gpio, int dur, const char* state_topic, const char* cur_topic) {
-      spub.set(state_topic, 60);
-      cpub.set(cur_topic, 60, 1);
+      spub.set(state_topic, PUB_INTERVAL);
+      cpub.set(cur_topic, PUB_INTERVAL, 1);
       relay = relay_gpio;
       curr = curr_gpio;
       max_duration = dur * 60L * 1000L; //Convert to ms
@@ -522,7 +562,7 @@ class Motor {
       last_on = 0;
       last_off = 0;
       pinMode(relay, OUTPUT);
-      digitalWrite(relay, HIGH); 
+      digitalWrite(relay, HIGH);
       lcdisplay();
       spub.updateState(on);
     }
@@ -604,7 +644,7 @@ class Motor {
         }
         else {
           unsigned long dur = millis() - last_off;
-          debug.debug("Not switching on motor: %ld (%ld)", dur, min_interval); 
+          debug.debug("Not switching on motor: %ld (%ld)", dur, min_interval);
           return;
         }
       }
@@ -643,7 +683,7 @@ class WaterLevelController {
           // We have enough water in storage tank
           int oht_check = oht.check();
           unsigned long mot_on = motor.on_duration();
-          debug.debug("Motor on for %lu (%lu)", mot_on, flow_dur);
+          debug.debug("Motor on for %lu (%lu, %ld)", mot_on, flow_dur, last_level);
           if (mot_on > flow_dur) {
             // Check if water is getting pumped
             if ((millis() - last_flow_chk) > flow_dur) {
@@ -653,24 +693,33 @@ class WaterLevelController {
               if ((level - last_level) < min_flow) {
                 // Motor not working
                 debug.info("Motor not pumping. Switching off");
-                motor.switch_off(); 
+                motor.switch_off();
+                last_level = 0;
               }
-              last_level = level;
+              else {
+                last_level = level;
+              }
             }
-          }
-          else if ((last_level == 0) && motor.is_on()) {
-            // Update the first time motor is on
-            last_level = oht.get_last();
           }
           if (oht_check < 0) {
             // Water in overhead tank less than lower threshold
             debug.debug("Switch on motor");
             motor.switch_on();
+            if (last_level == 0) {
+              last_level = oht.get_last();
+            }
+            // Check if motor is still on
+            if (not motor.is_on()) {
+              last_level = 0;
+            }
           }
           else if (oht_check > 0) {
             // Over the high threshold
             debug.debug("Switch off motor");
             motor.switch_off();
+            last_level = 0;
+          }
+          else if (not motor.is_on()) {
             last_level = 0;
           }
         }
@@ -679,6 +728,8 @@ class WaterLevelController {
           motor.switch_off();
           last_level = 0;
           debug.error("Water level in storage tank below threshold!");
+          // Check oht to update level
+          oht.check();
         }
       }
     }
