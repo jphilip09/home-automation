@@ -213,9 +213,9 @@ def main():
     log.addHandler(stderr_handler)
 
     config = {
-        'from-id': 'jrhomeauto@gmail.com',
-        'to-id': ['jphilip09@gmail.com'],
-        'priority-id': ['joerekha@gmail.com'],
+        'from-id': 'test1@gmail.com',
+        'to-id': ['test2@gmail.com'],
+        'priority-id': ['test3@gmail.com'],
         'config-dir': os.path.join(os.path.expanduser('~'),
                                    '.jrhomeauto'),
         'secrets-file': 'client_secret.json',
