@@ -367,7 +367,7 @@ class Publish {
 #endif
     }
 
-    void set(const char* topic, int max_interval) {
+    void set(const char* topic, long max_interval) {
       set(topic, max_interval, 0);
     }
 
@@ -572,6 +572,7 @@ class Motor {
     }
 
     unsigned long on_duration() {
+      spub.updateState(on);
       if (on) {
         return (millis() - last_on);
       }
@@ -613,6 +614,7 @@ class Motor {
     }
 
     bool check() {
+      spub.updateState(on);
       if (on) {
 #ifdef CURRENT_EN
         long cur = current();
