@@ -1,8 +1,11 @@
+#include <Arduino.h>
+
 /*
   Water Level Controller
 
   Circuit:
     On a Arduino Mega with Ethernet shield
+    Now on NodeMCU
     Ultrasound sensors for checking water level in both tanks
     Relay to control motor
     ACS712 20A current sensor  to check current flow for motor
@@ -26,22 +29,40 @@
 
 */
 
+// Enable MQTT
+// #define NW_SUPPORT
+
+// USe Wifi
+// #define WIFI_SUPPORT
+
+// Enable LCD
+// #define LCD_DISPLAY
+// #define LCD_I2C
+
 #include <SPI.h>
+#ifdef WIFI_SUPPORT
+#include <ESP8266WiFi.h>
+#else
 #include <Ethernet.h>
+#endif
 #include <PubSubClient.h>
+
+#ifdef LCD_DISPLAY
 #include <LiquidCrystal.h>
+#define LCDISPLAY
+#endif
+
+#ifdef LCD_I2C
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#define LCDISPLAY
+#endif
 
 
 // Enable or disable debug prints on serial
-#define DEBUG true
-#define INFO true
-#define PRINTF_BUF 80 // define the tmp buffer size
-
-// Enable LCD
-#define LCDISPLAY
-
-// Enable MQTT
-#define NW_SUPPORT
+// #define DEBUG true
+// #define INFO true
+#define PRINTF_BUF 124 // define the tmp buffer size
 
 // Current measurement needs to be fixed
 // #define CURRENT_ENABLE
@@ -56,14 +77,18 @@
 
 // Topic
 #define TOPIC "jr-mqtt/wlc"
+#define DBG_TOPIC "jr-mqtt/debug"
+
 // Max interval between publish of a topic in minutes
-#define PUB_INTERVAL 1 
+#define PUB_INTERVAL 1
 
 #define topic_cat(sub) TOPIC#sub
+#define topic_dbg(sub) DBG_TOPIC#sub
 
 // Overhead Tank specifics
 // Topic suffix
 #define OHT_TOPIC topic_cat(/oht/level)
+#define OHT_DBG topic_dbg(/oht)
 // Max water level in cms
 #define OHT_HT 140
 // Offset of sensor
@@ -71,40 +96,44 @@
 // High thershold in %
 #define OHT_HIGH 90
 // Low threshold
-#define OHT_LOW 35
+#define OHT_LOW 50
 // sensor GPIO pins
-#define OHT_TRIG 24
-#define OHT_ECHO 25
+#define OHT_TRIG 16 //D0
+#define OHT_ECHO 5  //D1
 
 // Storage Tank specifics
 // Topic suffix
 #define ST_TOPIC topic_cat(/s2/level)
+#define ST_DBG topic_dbg(/s2)
 // Max water level in cms
 #define ST_HT 180
 // Offset of sensor
-#define ST_OFF 30
+#define ST_OFF 50
 // High thershold in %
 #define ST_HIGH 100
 // Low threshold
 #define ST_LOW 17
 // sensor GPIO pins
-#define ST_TRIG 22
-#define ST_ECHO 23
+#define ST_TRIG 4 //D2
+#define ST_ECHO 0 //D3
 
 // Motor 2 specifics
 // ON/OFF Topic suffix
 #define M2_STATE_TOPIC topic_cat(/motor2/state)
+#define M2_DBG topic_dbg(/motor2)
 // Manual override topic
 #define M2_MANUAL topic_cat(/motor2/manual)
 // Maximum time to run at a time in mins
 #define M2_MAX_DUR 60
 // Relay GPIO pin
-#define M2_RELAY 26
-// Cuurent sensor Analog pin
+#define M2_RELAY 2 //D5
+#define MOTOR_ON LOW
+#define MOTOR_OFF HIGH
+// Current sensor Analog pin
 #define M2_CUR A0
 // Flow check
 #define FLOW_DUR 5 // Check flow every 5 mins
-#define MIN_FLOW_EXP 5 // Minimum change in level
+#define MIN_FLOW_EXP 3 // Minimum change in level
 
 // Current sensor details for ACS712 - 20A
 #define MVPERAMP 100
@@ -123,6 +152,11 @@
 #define LCD_D5_GPIO 31
 #define LCD_D6_GPIO 32
 #define LCD_D7_GPIO 33
+
+#define LCD_I2C_ADDR 0x27
+#define LCD_I2C_SDA 14
+#define LCD_I2C_SCL 12
+
 #define MOTOR_ROW 1
 #define OHT_ROW 2
 #define ST_ROW 3
@@ -133,12 +167,26 @@
 // Check the levels interval in secs
 #define CHECK_INT 15
 
-#ifdef LCDISPLAY
+#ifdef LCD_DISPLAY
 // initialize the library with the numbers of the interface pins
 LiquidCrystal lcd(LCD_RS_GPIO, LCD_EN_GPIO, LCD_D4_GPIO, LCD_D5_GPIO, LCD_D6_GPIO, LCD_D7_GPIO);
 #endif
 
+#ifdef LCD_I2C
+// Initialize LCD DIsplay with I2C interface
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
+#endif
+
 #ifdef NW_SUPPORT
+
+#ifdef WIFI_SUPPORT
+const char* ssid     = "joerekha";
+const char* password = "joerekha19990722";
+
+WiFiClient espClient;
+
+#else
+
 // Enter a MAC address for your controller below.
 // Newer Ethernet shields have a MAC address printed on a sticker on the shield
 byte mac[] = {
@@ -148,16 +196,19 @@ byte mac[] = {
 // Fallback IP
 IPAddress ip(FALLBACK_IP);
 
+// Initialize the Ethernet client library
+// with the IP address and port of the server
+// that you want to connect to (port 80 is default for HTTP):
+EthernetClient ethClient;
+
+#endif
+
 // MQTT server
 IPAddress server(MQTT_SERVER);
 
 // Maximum topics to subscribe
 #define MAX_SUBS 10
 
-// Initialize the Ethernet client library
-// with the IP address and port of the server
-// that you want to connect to (port 80 is default for HTTP):
-EthernetClient ethClient;
 PubSubClient client;
 #endif
 
@@ -246,7 +297,6 @@ class LcdDisplay {
 
 LcdDisplay ld;
 
-
 class LevelSensor {
   int trigger;
   int echo;
@@ -277,7 +327,7 @@ class LevelSensor {
       // Waiting for pulse
       t = pulseIn(echo, HIGH);
 
-      // Calculating distance 
+      // Calculating distance
       h = t / 58;
       debug.debug("Height calculated: %d", h);
 
@@ -285,7 +335,7 @@ class LevelSensor {
         return h;
       }
       else {
-        return h;
+        return -1;
       }
     }
 
@@ -309,6 +359,13 @@ class LevelSensor {
     }
 };
 
+
+class Subscribe {
+  // Virtual class to support subscribe callback function
+  public:
+    virtual void callback(String& topic, String& payload) = 0;
+};
+
 class Publish {
 #ifdef NW_SUPPORT
   long interval;
@@ -317,17 +374,24 @@ class Publish {
   long lastValue;
   bool lastState;
   char *my_topic;
+  char *my_debug;
 
   static int sub_count;
   static char* sub_topic[MAX_SUBS];
+  static Subscribe* sub_instance[MAX_SUBS];
 
   // buffer to convert value to string
   static const int buf_len = 80;
   static char buf[buf_len];
 #endif
 
-  static boolean reconnect() {
+  static boolean reconnect(bool force=false) {
 #ifdef NW_SUPPORT
+    if (force) {
+      if (client.connected()) {
+        client.disconnect();
+      }
+    }
     if (!client.connected()) {
 #ifdef MQTT_USER
       if (client.connect("jrMqttClient", MQTT_USER, MQTT_PASSWD)) {
@@ -335,11 +399,9 @@ class Publish {
       if (client.connect("jrMqttClient")) {
 #endif
         debug.info("MQTT connected");
-        if (sub_count) {
-          for (int i=0; i<sub_count; i++) {
-            client.subscribe(sub_topic[i]);
-            debug.info("Subscribe for %s", sub_topic[i]);
-          }
+        for (int i=0; i<sub_count; i++) {
+          client.subscribe(sub_topic[i]);
+          debug.info("Subscribe for %s", sub_topic[i]);
         }
       }
       else {
@@ -354,10 +416,11 @@ class Publish {
   }
 
   public:
-    void set(const char *topic, long max_interval, long max_diff)
+    void set(const char *topic, long max_interval, long max_diff, const char *dbg_top)
     {
 #ifdef NW_SUPPORT
       my_topic = (char*)topic;
+      my_debug = (char*)dbg_top;
       interval = max_interval * 60 * 1000; //Convert to millisecs
       diff = max_diff;
       lastUpdate = 0;
@@ -367,29 +430,53 @@ class Publish {
 #endif
     }
 
-    void set(const char* topic, long max_interval) {
-      set(topic, max_interval, 0);
+    void set(const char* topic, long max_interval, const char *dbg_top) {
+      set(topic, max_interval, 0, dbg_top);
     }
 
-    bool add_subscribe(String topic) {
+    bool add_subscribe(Subscribe* instance, String topic) {
 #ifdef NW_SUPPORT
       if (sub_count >= MAX_SUBS) {
         // Already max topics subscribed
         return false;
       }
-      sub_topic[sub_count] = (char*)topic.c_str();
+      sub_instance[sub_count] = instance;
+      sub_topic[sub_count] = (char*)malloc(topic.length()+1);
+      strncpy(sub_topic[sub_count], (char*)topic.c_str(), topic.length()+1);
+      debug.debug("Subscribe to topic: %s", sub_topic[sub_count]);
       sub_count++;
-      reconnect();
+      reconnect(true);
 #endif
       return true;
     }
 
+  void pub_dbg(const char* str) {
+#ifdef NW_SUPPORT
+    if (reconnect()) {
+      client.publish(my_debug, str);
+    }
+#endif
+  }
+
+  void pub_dbg1(const char* format, ...) {
+#ifdef NW_SUPPORT
+    if (reconnect()) {
+      va_list args;
+      va_start(args, format);
+      vsnprintf(buf, (PRINTF_BUF-1), format, args);
+      va_end(args);
+      client.publish(my_debug, buf);
+    }
+#endif
+ }
+
     void updateValue(long value) {
 #ifdef NW_SUPPORT
+      snprintf(buf, buf_len-1, "%ld", value);
+      pub_dbg(buf);
       if ((abs(lastValue - value) >= diff) || ((millis() - lastUpdate) >= interval)) {
         if (reconnect()) {
           lastValue = value;
-          snprintf(buf, buf_len-1, "%ld", value);
           lastUpdate = millis();
           client.publish(my_topic, buf);
           debug.info("Published topic %s with value: %s (%ld)", my_topic, buf, value);
@@ -400,10 +487,11 @@ class Publish {
 
     void updateValue_json(long value, int percentage) {
 #ifdef NW_SUPPORT
+      snprintf(buf, buf_len-1, "{ \"value\": %ld, \"percentage\": %d }", value, percentage);
+      pub_dbg(buf);
       if ((abs(lastValue - value) >= diff) || ((millis() - lastUpdate) >= interval)) {
         if (reconnect()) {
           lastValue = value;
-          snprintf(buf, buf_len-1, "{ \"value\": %ld, \"percentage\": %d }", value, percentage);
           lastUpdate = millis();
           client.publish(my_topic, buf);
           debug.info("Published topic %s with value: %s (%ld)", my_topic, buf, value);
@@ -414,15 +502,16 @@ class Publish {
 
     void updateState(bool state) {
 #ifdef NW_SUPPORT
+      if (state) {
+        strncpy(buf, "ON", buf_len-1);
+      }
+      else {
+        strncpy(buf, "OFF", buf_len-1);
+      }
+      pub_dbg(buf);
       if ((state != lastState) || (lastUpdate == 0) || ((millis() - lastUpdate) >= interval)) {
         if (reconnect()) {
           lastState = state;
-          if (state) {
-            strncpy(buf, "ON", buf_len-1);
-          }
-          else {
-            strncpy(buf, "OFF", buf_len-1);
-          }
           lastUpdate = millis();
           client.publish(my_topic, buf);
           debug.debug("Published topic %s with state: %s", my_topic, buf);
@@ -430,11 +519,25 @@ class Publish {
       }
 #endif
     }
+
+    static Subscribe* get_instance(String& topic) {
+      int i = 0;
+      const char* top = topic.c_str();
+      debug.debug("Check topic: %s", top);
+      for (i=0; i<sub_count; i++) {
+        debug.debug("Check against %s", sub_topic[i]);
+        if (strcmp(top, sub_topic[i]) == 0) {
+          return sub_instance[i];
+        }
+      }
+      return NULL;
+    }
 };
 
 #ifdef NW_SUPPORT
 // Define the static members
 int Publish::sub_count = 0;
+Subscribe* Publish::sub_instance[MAX_SUBS];
 char* Publish::sub_topic[MAX_SUBS];
 char Publish::buf[Publish::buf_len] = "";
 #endif
@@ -462,9 +565,9 @@ class Tank {
       disp_name = name;
     }
 
-    void set(int trig, int ec, int ht, int off, int upper, int lower, const char* topic) {
+    void set(int trig, int ec, int ht, int off, int upper, int lower, const char* topic, const char* dbg_top) {
       ls.set(trig, ec, off, ht+off);
-      pub.set(topic, PUB_INTERVAL, 2);
+      pub.set(topic, PUB_INTERVAL, 2, dbg_top);
 
       trigger = trig;
       echo = ec;
@@ -483,17 +586,34 @@ class Tank {
     int check() {
       int ret = 0;
       long l = ls.check_avg();
+      int tries = 0;
       while (l == -1) {
         delay(100);
+        tries++;
         l = ls.check();
+        if (tries > 5) {
+          break;
+        }
       }
-      long h = max_ht - (l - offset);
-      last_h = h;
-      int p = h * 100 / max_ht;
+      long h = -1;
+      int p = -1;
+      if (l != -1) {
+        h = max_ht - (l - offset);
+        last_h = h;
+        p = h * 100 / max_ht;
+      }
+
       char str[LCD_COLS+1];
       snprintf(str, LCD_COLS, "%-9s:%3ld (%3d)", disp_name, h, p);
       ld.display(disp_row, str);
       debug.debug("%s", str);
+      pub.pub_dbg(str);
+
+      if (h == -1) {
+        // Sensor not working
+        debug.error("%s Tank sensor not working!", disp_name);
+        return -2;
+      }
 
       if (h <= low_th) {
         ret = -1;
@@ -521,15 +641,16 @@ class StorageTank: public Tank {
     }
 };
 
-class Motor {
+class Motor: public Subscribe {
   int relay;
   int curr;
-  unsigned long max_duration;
-  unsigned long min_interval;
+  unsigned long max_duration = 0;
+  unsigned long min_interval = 0;
   const long tries = 5;
-  bool on;
-  unsigned long last_on;
-  unsigned long last_off;
+  bool on = false;
+  bool manual = false; // If the motor is in manual control
+  unsigned long last_on = 0;
+  unsigned long last_off = 0;
   Publish spub;
   Publish cpub;
   const int disp_row = MOTOR_ROW;
@@ -549,22 +670,29 @@ class Motor {
         snprintf(str, LCD_COLS, "%-9s: OFF", disp_name);
       }
       ld.display(disp_row, str);
+      spub.pub_dbg(str);
     }
 
-    void set(int relay_gpio, int curr_gpio, int dur, const char* state_topic, const char* cur_topic) {
-      spub.set(state_topic, PUB_INTERVAL);
-      cpub.set(cur_topic, PUB_INTERVAL, 1);
+    void set(int relay_gpio, int curr_gpio, long dur, const char* state_topic, const char* cur_topic, const char* sub_topic, const char* dbg_top) {
+      spub.set(state_topic, PUB_INTERVAL, dbg_top);
+      spub.add_subscribe(this, sub_topic);
+      cpub.set(cur_topic, PUB_INTERVAL, 1, dbg_top);
       relay = relay_gpio;
       curr = curr_gpio;
       max_duration = dur * 60L * 1000L; //Convert to ms
       min_interval = 5 * 60L * 1000L; // 5 min break before switch on
       on = false;
+      manual = false;
       last_on = 0;
       last_off = 0;
       pinMode(relay, OUTPUT);
       digitalWrite(relay, HIGH);
       lcdisplay();
       spub.updateState(on);
+    }
+
+    bool is_manual() {
+      return manual;
     }
 
     bool is_on() {
@@ -604,11 +732,12 @@ class Motor {
       if (on) {
         last_off = millis();
         on = false;
+        manual = false;
         debug.info("Motor off");
         lcdisplay();
       }
       debug.info("Switching off motor");
-      digitalWrite(relay, HIGH);
+      digitalWrite(relay, MOTOR_OFF);
       spub.updateState(on);
       // current();
     }
@@ -628,17 +757,18 @@ class Motor {
         unsigned long dur = millis() - last_on;
         if (dur > max_duration) {
           debug.info("Motor on longer than max duration (%lu, %lu)", dur, max_duration);
+          spub.pub_dbg("Motor on longer than max duration");
           switch_off();
         }
       }
       return on;
     }
 
-    void switch_on() {
+    void switch_on(bool force=false) {
       if (on) {
         check();
       }
-      else {
+      else if (not force) {
         if ((last_on == 0) || ((millis() - last_off) >= min_interval)) {
           debug.info("Switching on the motor");
           last_on = millis();
@@ -650,11 +780,39 @@ class Motor {
           return;
         }
       }
+
+      // If manual switch on
+      if (force) {
+        manual = true;
+        debug.debug("Switching on the motor maunally");
+        spub.pub_dbg("Switching on the motor maunally");
+        last_on = millis();
+        on = true;
+      }
+
       if (on) {
-        debug.debug("Switching on motor");
-        digitalWrite(relay, LOW);
+        debug.debug("Sending relay ON for motor");
+        digitalWrite(relay, MOTOR_ON);
         spub.updateState(on);
         lcdisplay();
+      }
+    }
+
+    void callback(String& topic, String& payload) {
+      static String on_str = String("ON");
+      static String off_str = String("OFF");
+
+      debug.debug(("Motor sub " + topic + ": " + payload).c_str());
+      if (payload.equals(on_str)) {
+        debug.info("Switch on motor manually");
+        switch_on(true);
+      }
+      else if (payload.equals(off_str)) {
+        debug.info("Switch off motor manually");
+        switch_off();
+      }
+      else {
+        debug.error("Unknown payload %s: %s", topic.c_str(), payload.c_str());
       }
     }
 };
@@ -673,20 +831,28 @@ class WaterLevelController {
   public:
 
     void set() {
-      oht.set(OHT_TRIG, OHT_ECHO, OHT_HT, OHT_OFF, OHT_HIGH, OHT_LOW, OHT_TOPIC);
-      st.set(ST_TRIG, ST_ECHO, ST_HT, ST_OFF, ST_HIGH, ST_LOW, ST_TOPIC);
-      motor.set(M2_RELAY, M2_CUR, M2_MAX_DUR, M2_STATE_TOPIC, M2_CUR_TOPIC);
+      oht.set(OHT_TRIG, OHT_ECHO, OHT_HT, OHT_OFF, OHT_HIGH, OHT_LOW, OHT_TOPIC, OHT_DBG);
+      st.set(ST_TRIG, ST_ECHO, ST_HT, ST_OFF, ST_HIGH, ST_LOW, ST_TOPIC, ST_DBG);
+      motor.set(M2_RELAY, M2_CUR, M2_MAX_DUR, M2_STATE_TOPIC, M2_CUR_TOPIC, M2_MANUAL, M2_DBG);
     }
 
     void loop() {
       if ((millis() - last_check) >= interval) {
         last_check = millis();
-        if (st.check() >= 0) {
+        int stl = st.check();
+        int ohtl = oht.check();
+        if ((stl == -2) || (ohtl == -2)) {
+          // One of the tank sensors is not working
+          motor.switch_off();
+          last_level = 0;
+          return;
+        }
+        if (stl >= 0) {
           // We have enough water in storage tank
-          int oht_check = oht.check();
           unsigned long mot_on = motor.on_duration();
           debug.debug("Motor on for %lu (%lu, %ld)", mot_on, flow_dur, last_level);
-          if (mot_on > flow_dur) {
+
+          if ((motor.is_manual() == false) && (mot_on > flow_dur)) {
             // Check if water is getting pumped
             if ((millis() - last_flow_chk) > flow_dur) {
               last_flow_chk = millis();
@@ -703,7 +869,7 @@ class WaterLevelController {
               }
             }
           }
-          if (oht_check < 0) {
+          if (ohtl < 0) {
             // Water in overhead tank less than lower threshold
             debug.debug("Switch on motor");
             motor.switch_on();
@@ -715,7 +881,7 @@ class WaterLevelController {
               last_level = 0;
             }
           }
-          else if (oht_check > 0) {
+          else if (ohtl > 0) {
             // Over the high threshold
             debug.debug("Switch off motor");
             motor.switch_off();
@@ -730,15 +896,17 @@ class WaterLevelController {
           motor.switch_off();
           last_level = 0;
           debug.error("Water level in storage tank below threshold!");
-          // Check oht to update level
-          oht.check();
         }
       }
     }
 };
 
+
+#ifdef NW_SUPPORT
+#ifdef WIFI_SUPPORT
+#else
 long last_eth_check = 0;
-long eth_check_interval = 60 * 1000; // 1 min
+long eth_check_interval = 60L * 1000; // 1 min
 void eth_maintain() {
   if ((millis() - last_eth_check) >= eth_check_interval) {
     last_eth_check = millis();
@@ -781,21 +949,84 @@ void eth_maintain() {
     }
   }
 }
+#endif
+#endif
 
 WaterLevelController wlc;
 
+char message_buff[100];
+
 void callback(char* topic, byte* payload, unsigned int length) {
   // handle message arrived
+  String top = String(topic);
+  debug.info("Message arrived:  topic: %s", topic);
+  debug.debug("Length: %u", length);
+
+  int i = 0;
+  // create character buffer with ending null terminator (string)
+  for(i=0; i<length; i++) {
+    message_buff[i] = payload[i];
+  }
+  message_buff[i] = '\0';
+
+  String msgString = String(message_buff);
+
+  debug.debug("Payload: %s", msgString.c_str());
+
+  Subscribe* instance = Publish::get_instance(top);
+  if (instance == NULL) {
+    debug.error("Did not find instance for topic: %s", topic);
+    return;
+  }
+
+  instance->callback(top, msgString);
 }
+
+#ifdef WIFI_SUPPORT
+void setup_wifi() {
+
+  delay(10);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+#endif
 
 void setup() {
   // Open serial communications and wait for port to open:
   Serial.begin(115200);
 
-#ifdef LCDISPLAY
+#ifdef LCD_DISPLAY
   lcd.begin(LCD_COLS, LCD_ROWS);
 #endif
 
+#ifdef LCD_I2C
+  Wire.begin(LCD_I2C_SDA, LCD_I2C_SCL);
+  // initialize the LCD
+  lcd.init(LCD_I2C_SDA, LCD_I2C_SCL);
+
+  lcd.backlight();
+#endif
+
+#ifdef NW_SUPPORT
+#ifdef WIFI_SUPPORT
+  setup_wifi();
+  client = PubSubClient(server, 1883, callback, espClient);
+#else
   // start the Ethernet connection:
   if (Ethernet.begin(mac) == 0) {
     Serial.println("Failed to configure Ethernet using DHCP");
@@ -806,10 +1037,12 @@ void setup() {
   // print your local IP address:
   printIPAddress();
 
-  client = PubSubClient(server, 1883, ethClient);
+  client = PubSubClient(server, 1883, callback, ethClient);
+#endif
 
   //client.setServer(server, 1883);
   client.setCallback(callback);
+#endif
 
   // WaterLevelController init
   wlc.set();
@@ -823,10 +1056,18 @@ void loop() {
 
   client.loop();
 
+#ifdef NW_SUPPORT
+#ifdef WIFI_SUPPORT
+#else
   eth_maintain();
+#endif
+#endif
 
 }
 
+#ifdef NW_SUPPORT
+#ifdef WIFI_SUPPORT
+#else
 void printIPAddress()
 {
   Serial.print("My IP address: ");
@@ -838,3 +1079,5 @@ void printIPAddress()
 
   Serial.println();
 }
+#endif
+#endif

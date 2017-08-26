@@ -12,9 +12,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
+#
 # Add a client to subscribe to MQTT and send mail
+#
 # Created by Philip Joseph <jphilip09@gmail.com>
-
+#
+# References:
+#    hbmqtt example: https://github.com/beerfactory/hbmqtt/blob/master/samples/client_subscribe.py
+#
 # NOTE: Not yet complete!!
 
 
@@ -33,29 +38,6 @@ from hbmqtt.client import MQTTClient
 from .gmail import GmailIntf
 
 log = logging.getLogger('jr-home-automation')
-
-
-# Taken from hbmqtt example
-# @asyncio.coroutine
-# def uptime_coro():
-#     C = MQTTClient()
-#     yield from C.connect('mqtt://test.mosquitto.org/')
-#     # Subscribe to '$SYS/broker/uptime' with QOS=1
-#     yield from C.subscribe([
-#                 ('$SYS/broker/uptime', QOS_1),
-#                 ('$SYS/broker/load/#', QOS_2),
-#              ])
-#     log.info("Subscribed")
-#     try:
-#         for i in range(1, 100):
-#             message = yield from C.deliver_message()
-#             packet = message.publish_packet
-#             print("%d: %s => %s" % (i, packet.variable_header.topic_name, str(packet.payload.data)))
-#         yield from C.unsubscribe(['$SYS/broker/uptime', '$SYS/broker/load/#'])
-#         log.info("UnSubscribed")
-#         yield from C.disconnect()
-#     except ClientException as ce:
-#         log.error("Client exception: %s" % ce)
 
 
 def calculate_volume(height, radius):
@@ -130,7 +112,7 @@ class Notify(object):
         config = {
             'application-name': cls.APPLICATION_NAME,
             'mqtt-topic': [('$SYS/broker/uptime', QOS_1)],
-            'mqtt-url': 'mqtt://test.mosquitto.org/'
+            'mqtt-url': 'mqtt://test.mosquitto.org/',
             'from-id': None,
             'to-id': [],
             'priority-id': [],
