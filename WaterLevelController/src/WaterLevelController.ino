@@ -180,8 +180,8 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 #ifdef NW_SUPPORT
 
 #ifdef WIFI_SUPPORT
-const char* ssid     = "joerekha";
-const char* password = "joerekha19990722";
+const char* ssid     = "ssid";
+const char* password = "password";
 
 WiFiClient espClient;
 
