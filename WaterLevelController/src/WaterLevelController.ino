@@ -39,6 +39,7 @@
 // #define LCD_DISPLAY
 // #define LCD_I2C
 
+#include <EEPROM.h>
 #include <SPI.h>
 #ifdef WIFI_SUPPORT
 #include <ESP8266WiFi.h>
@@ -63,6 +64,7 @@
 // #define DEBUG true
 // #define INFO true
 #define PRINTF_BUF 124 // define the tmp buffer size
+#define EEPROM_MAX_ADDR 511 // Restrict the EEPROM address usage
 
 // Current measurement needs to be fixed
 // #define CURRENT_ENABLE
@@ -122,7 +124,13 @@
 #define M2_STATE_TOPIC topic_cat(/motor2/state)
 #define M2_DBG topic_dbg(/motor2)
 // Manual override topic
-#define M2_MANUAL topic_cat(/motor2/manual)
+#define M2_MANUAL topic_cat(/motor2/switch)
+
+// Set the Automatic or Manual mode
+#define M2_MANUAL_MODE topic_cat(/motor2/manual-mode)
+#define M2_MANUAL_STATE topic_cat(/motor2/manual-state)
+#define M2_MANUAL_MODE_ADDR 0x00
+
 // Maximum time to run at a time in mins
 #define M2_MAX_DUR 60
 // Relay GPIO pin
@@ -180,8 +188,9 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 #ifdef NW_SUPPORT
 
 #ifdef WIFI_SUPPORT
-const char* ssid     = "ssid";
-const char* password = "password";
+char ssid[16]     = "";
+char password[32] = "";
+#define WIFI_DETAILS_ADDR 0x04
 
 WiFiClient espClient;
 
@@ -211,6 +220,98 @@ IPAddress server(MQTT_SERVER);
 
 PubSubClient client;
 #endif
+
+//
+// Reads a string starting from the specified address.
+// Returns true if at least one byte (even only the
+// string terminator one) is read.
+// Returns false if the start address falls outside
+// or declare buffer size os zero.
+// the allowed range.
+// The reading might stop for several reasons:
+// - no more space in the provided buffer
+// - last eeprom address reached
+// - string terminator byte (0x00) encountered.
+// The last condition is what should normally occur.
+//
+boolean eeprom_read_string(int addr, char* buffer, int bufSize) {
+  // byte read from eeprom
+  byte ch;
+
+  // number of bytes read so far
+  int bytesRead;
+
+  // check start address
+  if (addr >= EEPROM_MAX_ADDR+1) {
+    return false;
+  }
+
+  // how can we store bytes in an empty buffer ?
+  if (bufSize == 0) {
+    return false;
+  }
+
+  // is there is room for the string terminator only,
+  // no reason to go further
+  if (bufSize == 1) {
+    buffer[0] = 0;
+    return true;
+  }
+
+  // initialize byte counter
+  bytesRead = 0;
+
+  // read next byte from eeprom
+  EEPROM.begin(EEPROM_MAX_ADDR+1);
+  ch = EEPROM.read(addr + bytesRead);
+
+  // store it into the user buffer
+  buffer[bytesRead] = ch;
+
+  // increment byte counter
+  bytesRead++;
+
+  // stop conditions:
+  // - the character just read is the string terminator one (0x00)
+  // - we have filled the user buffer
+  // - we have reached the last eeprom address
+  while ( (ch != 0x00) && (bytesRead < bufSize) && ((addr + bytesRead) < 511) ) {
+    // if no stop condition is met, read the next byte from eeprom
+    ch = EEPROM.read(addr + bytesRead);
+
+    // store it into the user buffer
+    buffer[bytesRead] = ch;
+
+    // increment byte counter
+    bytesRead++;
+  }
+
+  // make sure the user buffer has a string terminator
+  // (0x00) as its last byte
+  if ((ch != 0x00) && (bytesRead >= 1)) {
+    buffer[bytesRead - 1] = 0;
+  }
+
+  EEPROM.commit();
+  EEPROM.end();
+  return true;
+}
+
+void update_eeprom(int addr, char val) {
+  EEPROM.begin(EEPROM_MAX_ADDR+1);
+  EEPROM.write(addr, val);
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+char read_eeprom(int addr) {
+  byte ch;
+  EEPROM.begin(EEPROM_MAX_ADDR+1);
+  ch = EEPROM.read(addr);
+  EEPROM.commit();
+  EEPROM.end();
+  return ch;
+}
 
 class Debug {
   bool deb = false;
@@ -470,20 +571,29 @@ class Publish {
 #endif
  }
 
-    void updateValue(long value) {
+ void updateStr(const char* str) {
 #ifdef NW_SUPPORT
-      snprintf(buf, buf_len-1, "%ld", value);
-      pub_dbg(buf);
-      if ((abs(lastValue - value) >= diff) || ((millis() - lastUpdate) >= interval)) {
-        if (reconnect()) {
-          lastValue = value;
-          lastUpdate = millis();
-          client.publish(my_topic, buf);
-          debug.info("Published topic %s with value: %s (%ld)", my_topic, buf, value);
-        }
-      }
+   snprintf(buf, buf_len-1, "%s", str);
+   pub_dbg(buf);
+   client.publish(my_topic, buf);
+   debug.info("Published topic %s with value: %s", my_topic, buf);
 #endif
+ }
+
+  void updateValue(long value) {
+#ifdef NW_SUPPORT
+    snprintf(buf, buf_len-1, "%ld", value);
+    pub_dbg(buf);
+    if ((abs(lastValue - value) >= diff) || ((millis() - lastUpdate) >= interval)) {
+      if (reconnect()) {
+        lastValue = value;
+        lastUpdate = millis();
+        client.publish(my_topic, buf);
+        debug.info("Published topic %s with value: %s (%ld)", my_topic, buf, value);
+      }
     }
+#endif
+  }
 
     void updateValue_json(long value, int percentage) {
 #ifdef NW_SUPPORT
@@ -653,8 +763,12 @@ class Motor: public Subscribe {
   unsigned long last_off = 0;
   Publish spub;
   Publish cpub;
+  Publish mpub;
   const int disp_row = MOTOR_ROW;
   const char *disp_name;
+  bool automatic = true; // Disable automatic pumping
+  const char* switch_topic = NULL;
+  const char* mode_topic = NULL;
 
   public:
     Motor():
@@ -671,12 +785,26 @@ class Motor: public Subscribe {
       }
       ld.display(disp_row, str);
       spub.pub_dbg(str);
+
+      if (automatic) {
+        snprintf(str, LCD_COLS, "%-9s: OFF", "Manual");
+      }
+      else {
+        snprintf(str, LCD_COLS, "%-9s: ON ", "Manual");
+      }
+      ld.display(0, str);
+      spub.pub_dbg(str);
     }
 
-    void set(int relay_gpio, int curr_gpio, long dur, const char* state_topic, const char* cur_topic, const char* sub_topic, const char* dbg_top) {
+    void set(int relay_gpio, int curr_gpio, long dur, const char* state_topic,
+      const char* cur_topic, const char* sub_topic, const char* dbg_top,
+      const char* man_topic, const char* man_state, bool manual_mode) {
       spub.set(state_topic, PUB_INTERVAL, dbg_top);
       spub.add_subscribe(this, sub_topic);
       cpub.set(cur_topic, PUB_INTERVAL, 1, dbg_top);
+      mpub.set(man_state, PUB_INTERVAL, dbg_top);
+      mpub.add_subscribe(this, man_topic);
+
       relay = relay_gpio;
       curr = curr_gpio;
       max_duration = dur * 60L * 1000L; //Convert to ms
@@ -685,10 +813,18 @@ class Motor: public Subscribe {
       manual = false;
       last_on = 0;
       last_off = 0;
+      switch_topic = sub_topic;
+      mode_topic = man_topic;
       pinMode(relay, OUTPUT);
       digitalWrite(relay, HIGH);
-      lcdisplay();
       spub.updateState(on);
+      automatic = !manual_mode;
+      mpub.updateState(manual_mode);
+      lcdisplay();
+    }
+
+    bool is_auto() {
+      return manual;
     }
 
     bool is_manual() {
@@ -765,6 +901,11 @@ class Motor: public Subscribe {
     }
 
     void switch_on(bool force=false) {
+      if (not automatic and not force) {
+        // IF automatic mode is OFF
+        return;
+      }
+
       if (on) {
         check();
       }
@@ -803,16 +944,39 @@ class Motor: public Subscribe {
       static String off_str = String("OFF");
 
       debug.debug(("Motor sub " + topic + ": " + payload).c_str());
-      if (payload.equals(on_str)) {
-        debug.info("Switch on motor manually");
-        switch_on(true);
+      if (topic.equals(switch_topic)) {
+        if (payload.equals(on_str)) {
+          debug.info("Switch on motor manually");
+          switch_on(true);
+        }
+        else if (payload.equals(off_str)) {
+          debug.info("Switch off motor manually");
+          switch_off();
+        }
+        else {
+          debug.error("Unknown payload %s: %s", topic.c_str(), payload.c_str());
+        }
       }
-      else if (payload.equals(off_str)) {
-        debug.info("Switch off motor manually");
-        switch_off();
-      }
-      else {
-        debug.error("Unknown payload %s: %s", topic.c_str(), payload.c_str());
+      else if (topic.equals(mode_topic)) {
+        if (payload.equals(on_str)) {
+          debug.info("Manual motor control");
+          automatic = false;
+          mpub.updateState(!automatic);
+          update_eeprom(M2_MANUAL_MODE_ADDR, 0x01);
+          lcdisplay();
+          switch_off();
+        }
+        else if (payload.equals(off_str)) {
+          debug.info("Automatic motor control");
+          automatic = true;
+          mpub.updateState(!automatic);
+          update_eeprom(M2_MANUAL_MODE_ADDR, 0x00);
+          lcdisplay();
+          switch_off();
+        }
+        else {
+          debug.error("Unknown payload %s: %s", topic.c_str(), payload.c_str());
+        }
       }
     }
 };
@@ -830,10 +994,11 @@ class WaterLevelController {
 
   public:
 
-    void set() {
+    void set(bool manual_mode) {
       oht.set(OHT_TRIG, OHT_ECHO, OHT_HT, OHT_OFF, OHT_HIGH, OHT_LOW, OHT_TOPIC, OHT_DBG);
       st.set(ST_TRIG, ST_ECHO, ST_HT, ST_OFF, ST_HIGH, ST_LOW, ST_TOPIC, ST_DBG);
-      motor.set(M2_RELAY, M2_CUR, M2_MAX_DUR, M2_STATE_TOPIC, M2_CUR_TOPIC, M2_MANUAL, M2_DBG);
+      motor.set(M2_RELAY, M2_CUR, M2_MAX_DUR, M2_STATE_TOPIC, M2_CUR_TOPIC,
+        M2_MANUAL, M2_DBG, M2_MANUAL_MODE, M2_MANUAL_STATE, manual_mode);
     }
 
     void loop() {
@@ -987,22 +1152,45 @@ void setup_wifi() {
 
   delay(10);
   // We start by connecting to a WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
+  if (eeprom_read_string(WIFI_DETAILS_ADDR, ssid, 16)) {
+    if (eeprom_read_string(WIFI_DETAILS_ADDR + strlen(ssid) + 1, password, 32)) {
+      Serial.println();
+      Serial.print("Connecting to ");
+      Serial.println(ssid);
+      // Serial.println(password);
+      Serial.println();
+      Serial.print("MAC: ");
+      Serial.println(WiFi.macAddress());
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+      while (WiFi.status() != WL_CONNECTED) {
+        // WiFi.printDiag(Serial);
+        delay(500);
+        Serial.print(".");
+      }
+
+      Serial.println("");
+      Serial.println("WiFi connected");
+      Serial.println("IP address: ");
+      Serial.println(WiFi.localIP());
+    }
+    else {
+      while (true) {
+        Serial.println();
+        Serial.print("ERROR reading WIFI password!");
+        delay(1000);
+      }
+    }
   }
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+  else {
+    while (true) {
+      Serial.println();
+      Serial.print("ERROR reading WIFI SSID!");
+      delay(1000);
+    }
+  }
 }
 #endif
 
@@ -1024,6 +1212,8 @@ void setup() {
 
 #ifdef NW_SUPPORT
 #ifdef WIFI_SUPPORT
+  // Read the ssid and password
+
   setup_wifi();
   client = PubSubClient(server, 1883, callback, espClient);
 #else
@@ -1045,7 +1235,8 @@ void setup() {
 #endif
 
   // WaterLevelController init
-  wlc.set();
+  byte ch = read_eeprom(M2_MANUAL_MODE_ADDR);
+  wlc.set((ch == 0x01));
 }
 
 
